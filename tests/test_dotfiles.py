@@ -1,6 +1,4 @@
 import contextlib
-import importlib.machinery
-import importlib.util
 import io
 import os
 import stat
@@ -9,12 +7,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
-SCRIPT = Path(__file__).resolve().parents[1] / "dotfiles"
-LOADER = importlib.machinery.SourceFileLoader("dotfiles_cli", str(SCRIPT))
-SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
-dotfiles = importlib.util.module_from_spec(SPEC)
-LOADER.exec_module(dotfiles)
+from dotfiles_app.app import ArgumentParserFactory, DotfilesApplication
+from dotfiles_app.commands import ApplyCommand, CommandContext, CommandFactory
+from dotfiles_app.core import DotfilesError
+from dotfiles_app.deployment import Deployment
+from dotfiles_app.skills import SkillManager
+from dotfiles_app.system import CommandRunner, HomebrewManager, PlatformDetector
 
 
 class DeploymentTest(unittest.TestCase):
@@ -26,7 +24,7 @@ class DeploymentTest(unittest.TestCase):
         self.state = self.root / "state"
         (self.repo / "home").mkdir(parents=True)
         self.home.mkdir()
-        self.deployment = dotfiles.Deployment(self.repo, self.home, self.state)
+        self.deployment = Deployment(self.repo, self.home, self.state)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -103,7 +101,7 @@ class DeploymentTest(unittest.TestCase):
         self.quiet_apply()
         destination.write_text("local edit\n", encoding="utf-8")
 
-        with self.assertRaises(dotfiles.DotfilesError):
+        with self.assertRaises(DotfilesError):
             self.quiet_restore()
         self.quiet_restore(force=True)
 
@@ -129,10 +127,14 @@ class DeploymentTest(unittest.TestCase):
         destination = self.target(".profile", "original\n")
 
         def fail_deploy(source, target):
-            dotfiles.remove_path(target)
+            self.deployment.filesystem.remove(target)
             raise RuntimeError("simulated interruption")
 
-        with mock.patch.object(dotfiles, "deploy_leaf", side_effect=fail_deploy):
+        with mock.patch.object(
+            self.deployment.filesystem,
+            "deploy_leaf",
+            side_effect=fail_deploy,
+        ):
             with self.assertRaises(RuntimeError):
                 self.quiet_apply()
         self.assertTrue((self.state / "journal.json").exists())
@@ -202,7 +204,7 @@ class DeploymentTest(unittest.TestCase):
         destination = self.target(".profile", "original\n")
         self.quiet_apply()
 
-        with self.assertRaises(dotfiles.DotfilesError):
+        with self.assertRaises(DotfilesError):
             self.quiet_restore(target="not-a-transaction")
 
         self.assertEqual(destination.read_text(encoding="utf-8"), "managed\n")
@@ -223,8 +225,12 @@ class DeploymentTest(unittest.TestCase):
 
 
 class SkillManagementTest(unittest.TestCase):
+    def setUp(self):
+        self.runner = mock.Mock(spec=CommandRunner)
+        self.manager = SkillManager(Path("/repo"), self.runner)
+
     def test_add_targets_universal_directory_with_copies(self):
-        command = dotfiles.skills_command(
+        command = self.manager.build_command(
             Path("/fake/npx"),
             ["add", "owner/repo", "--skill", "example"],
         )
@@ -246,92 +252,151 @@ class SkillManagementTest(unittest.TestCase):
 
     def test_global_and_alternate_agent_flags_are_rejected(self):
         for flag in ("--global", "-g", "--agent", "-a", "--all"):
-            with self.subTest(flag=flag), self.assertRaises(dotfiles.DotfilesError):
-                dotfiles.skills_command(Path("/fake/npx"), ["add", "owner/repo", flag])
+            with self.subTest(flag=flag), self.assertRaises(DotfilesError):
+                self.manager.build_command(
+                    Path("/fake/npx"),
+                    ["add", "owner/repo", flag],
+                )
 
     def test_update_is_limited_to_project(self):
-        command = dotfiles.skills_command(Path("/fake/npx"), ["update", "--yes"])
+        command = self.manager.build_command(
+            Path("/fake/npx"),
+            ["update", "--yes"],
+        )
         self.assertEqual(
             command,
             ["/fake/npx", "--yes", "skills", "update", "--yes", "--project"],
         )
 
-    def test_manage_skills_runs_from_home_source(self):
+    def test_manager_runs_from_home_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
             (repo / "home").mkdir()
-            with mock.patch.object(dotfiles.shutil, "which", return_value="/fake/npx"), mock.patch.object(
-                dotfiles, "run_command"
-            ) as run:
-                dotfiles.manage_skills(repo, ["list", "--json"])
-            run.assert_called_once_with(
+            manager = SkillManager(repo, self.runner)
+            with mock.patch(
+                "dotfiles_app.skills.shutil.which",
+                return_value="/fake/npx",
+            ):
+                manager.run(["list", "--json"])
+            self.runner.run.assert_called_once_with(
                 ["/fake/npx", "--yes", "skills", "list", "--json"],
-                cwd=repo / "home",
+                cwd=repo.resolve() / "home",
             )
 
     def test_parser_passes_through_skill_arguments(self):
-        args = dotfiles.make_parser().parse_args(
+        arguments = ArgumentParserFactory.create().parse_args(
             ["skills", "add", "owner/repo", "--skill", "example"]
         )
         self.assertEqual(
-            args.arguments,
+            arguments.arguments,
             ["add", "owner/repo", "--skill", "example"],
         )
 
 
+class CommandPatternTest(unittest.TestCase):
+    def test_factory_creates_concrete_command(self):
+        context = mock.Mock(spec=CommandContext)
+        arguments = ArgumentParserFactory.create().parse_args(["apply", "--dry-run"])
+
+        command = CommandFactory().create("apply", context, arguments)
+
+        self.assertIsInstance(command, ApplyCommand)
+
+    def test_application_delegates_to_command_object(self):
+        command = mock.Mock()
+        command.execute.return_value = 7
+        factory = mock.Mock(spec=CommandFactory)
+        factory.create.return_value = command
+
+        with tempfile.TemporaryDirectory() as temporary:
+            application = DotfilesApplication(
+                repo=Path(temporary),
+                command_factory=factory,
+            )
+            result = application.run(["status"])
+
+        self.assertEqual(result, 7)
+        command.execute.assert_called_once_with()
+        factory.create.assert_called_once()
+
+
 class PlatformTest(unittest.TestCase):
+    def setUp(self):
+        self.detector = PlatformDetector()
+
     def test_os_release_parser(self):
         with tempfile.TemporaryDirectory() as temporary:
             release = Path(temporary) / "os-release"
-            release.write_text('ID="ubuntu"\nID_LIKE=debian\nPRETTY_NAME="Ubuntu Test"\n', encoding="utf-8")
-            self.assertEqual(dotfiles.parse_os_release(release)["PRETTY_NAME"], "Ubuntu Test")
+            release.write_text(
+                'ID="ubuntu"\nID_LIKE=debian\nPRETTY_NAME="Ubuntu Test"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                self.detector.parse_os_release(release)["PRETTY_NAME"],
+                "Ubuntu Test",
+            )
 
     def test_platform_families(self):
-        self.assertEqual(dotfiles.platform_family("Darwin", {}), "macos")
-        self.assertEqual(dotfiles.platform_family("Linux", {"ID": "ubuntu"}), "debian")
-        self.assertEqual(dotfiles.platform_family("Linux", {"ID": "fedora"}), "fedora")
-        self.assertEqual(dotfiles.platform_family("Linux", {"ID": "arch"}), "unsupported")
+        self.assertEqual(self.detector.family("Darwin", {}), "macos")
+        self.assertEqual(self.detector.family("Linux", {"ID": "ubuntu"}), "debian")
+        self.assertEqual(self.detector.family("Linux", {"ID": "fedora"}), "fedora")
+        self.assertEqual(self.detector.family("Linux", {"ID": "arch"}), "unsupported")
 
     def test_ubuntu_prerequisites(self):
-        commands = dotfiles.prerequisite_commands("debian", True)
+        commands = self.detector.prerequisites("debian").commands(True)
         self.assertEqual(commands[0], ["sudo", "apt-get", "update"])
         self.assertIn("build-essential", commands[1])
         self.assertIn("procps", commands[1])
 
     def test_fedora_prerequisites(self):
-        commands = dotfiles.prerequisite_commands("fedora", True)
+        commands = self.detector.prerequisites("fedora").commands(True)
         self.assertIn("development-tools", commands[0])
         self.assertIn("procps-ng", commands[1])
 
+
+class HomebrewManagerTest(unittest.TestCase):
+    def setUp(self):
+        self.runner = mock.Mock(spec=CommandRunner)
+        self.detector = mock.Mock(spec=PlatformDetector)
+        self.manager = HomebrewManager(
+            Path.cwd(),
+            runner=self.runner,
+            detector=self.detector,
+        )
+
     def test_existing_homebrew_skips_bootstrap_commands(self):
         brew = Path("/fake/bin/brew")
-        with mock.patch.object(dotfiles, "find_brew", return_value=brew), mock.patch.object(
-            dotfiles, "run_command"
-        ) as run:
+        with mock.patch.object(self.manager, "find_brew", return_value=brew):
             with contextlib.redirect_stdout(io.StringIO()):
-                result = dotfiles.bootstrap_homebrew(assume_yes=True)
+                result = self.manager.bootstrap(assume_yes=True)
         self.assertEqual(result, brew)
-        run.assert_not_called()
+        self.runner.run.assert_not_called()
 
     def test_unsupported_linux_fails_with_instructions(self):
-        with mock.patch.object(dotfiles, "find_brew", return_value=None), mock.patch.object(
-            dotfiles, "platform_family", return_value="unsupported"
-        ), mock.patch.object(
-            dotfiles, "parse_os_release", return_value={"PRETTY_NAME": "Test Linux"}
-        ), mock.patch.object(dotfiles.os, "geteuid", return_value=1000):
-            with self.assertRaises(dotfiles.DotfilesError) as raised:
-                dotfiles.bootstrap_homebrew(assume_yes=True)
+        self.detector.family.return_value = "unsupported"
+        self.detector.parse_os_release.return_value = {"PRETTY_NAME": "Test Linux"}
+        with mock.patch.object(self.manager, "find_brew", return_value=None), mock.patch(
+            "dotfiles_app.system.os.geteuid",
+            return_value=1000,
+        ):
+            with self.assertRaises(DotfilesError) as raised:
+                self.manager.bootstrap(assume_yes=True)
         self.assertIn("Test Linux", str(raised.exception))
 
     def test_package_command_uses_repository_brewfile(self):
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
             (repo / "Brewfile").write_text('brew "git"\n', encoding="utf-8")
-            with mock.patch.object(dotfiles, "find_brew", return_value=Path("/fake/brew")), mock.patch.object(
-                dotfiles, "run_command"
-            ) as run:
-                dotfiles.install_packages(repo)
-            run.assert_called_once_with(["/fake/brew", "bundle", f"--file={repo / 'Brewfile'}"])
+            manager = HomebrewManager(repo, runner=self.runner, detector=self.detector)
+            with mock.patch.object(
+                manager,
+                "find_brew",
+                return_value=Path("/fake/brew"),
+            ):
+                manager.install_packages()
+            self.runner.run.assert_called_once_with(
+                ["/fake/brew", "bundle", f"--file={repo.resolve() / 'Brewfile'}"]
+            )
 
 
 if __name__ == "__main__":

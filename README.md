@@ -199,14 +199,28 @@ The CLI locates Homebrew in the standard Apple Silicon, Intel macOS, and Linuxbr
 
 ## Development
 
-The deployment implementation uses only the Python standard library. Node.js is installed through the Brewfile solely for `npx skills`. Run tests with:
+The deployment implementation uses only the Python standard library. Node.js is installed through the Brewfile solely for `npx skills`.
+
+The executable `dotfiles` is a thin entry point. Object-oriented services live in `dotfiles_app/`:
+
+- `app.py` composes services and parses arguments.
+- `commands.py` implements each CLI operation as a Command object and uses a factory for dispatch.
+- `configuration.py` resolves repository, target-home, and state paths.
+- `deployment.py` owns inventories, plans, transactions, state, and restoration.
+- `filesystem.py` handles symlink-aware filesystem and atomic JSON operations.
+- `system.py` uses platform strategies for prerequisites and manages Homebrew.
+- `skills.py` manages repository-installed agent skills.
+
+The design uses Command for CLI actions, Factory for command and deployment creation, Strategy for platform prerequisites, and repository-style state objects for transaction persistence. Dependencies are injected so these components remain independently testable.
+
+Run tests with:
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 -m py_compile dotfiles
+python3 -m py_compile dotfiles dotfiles_app/*.py
 ```
 
-Tests always use temporary repository, home, and state directories.
+Tests use temporary repository, home, and state directories. Service dependencies can be injected for isolated tests.
 
 ## Secrets
 

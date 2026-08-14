@@ -5,7 +5,14 @@
 | Path | Purpose |
 |---|---|
 | `home/` | Canonical files copied into the active home |
-| `dotfiles` | Standard-library Python deployment, bootstrap, and skill-management CLI |
+| `dotfiles` | Thin executable entry point |
+| `dotfiles_app/app.py` | CLI composition and argument parsing |
+| `dotfiles_app/commands.py` | Command objects, shared command context, and command factory |
+| `dotfiles_app/configuration.py` | Resolved application path configuration |
+| `dotfiles_app/deployment.py` | Deployment planning, transactions, state, and restoration |
+| `dotfiles_app/filesystem.py` | Symlink-aware filesystem and atomic JSON services |
+| `dotfiles_app/system.py` | Platform detection, command execution, and Homebrew management |
+| `dotfiles_app/skills.py` | Repository-managed `npx skills` integration |
 | `.dotfilesignore` | Repository-only paths excluded from home deployment |
 | `Brewfile` | Cross-platform Homebrew package inventory |
 | `tests/` | Standard-library unit tests using temporary homes |
@@ -23,6 +30,10 @@ Runtime state must remain outside the repository, normally in `${XDG_STATE_HOME:
 - Put packages in `Brewfile`, using `on_macos` and `on_linux` for platform-specific entries.
 - Never add secrets or credentials beneath `home/`.
 - Filesystem changes must be journaled and recoverable before active-home paths are replaced.
+- Keep the entry point thin; add behavior to the responsible service class in `dotfiles_app/`.
+- Implement new CLI operations as `CliCommand` classes and register them with `CommandFactory`.
+- Use strategies for platform-specific behavior instead of adding package-manager conditionals.
+- Inject filesystem, runner, console, factory, and platform services when behavior needs isolated testing.
 
 ## lookup
 
@@ -39,7 +50,7 @@ Runtime state must remain outside the repository, normally in `${XDG_STATE_HOME:
 ./dotfiles doctor
 ./dotfiles skills list --json
 python3 -m unittest discover -s tests -v
-python3 -m py_compile dotfiles
+python3 -m py_compile dotfiles dotfiles_app/*.py
 ```
 
 Use `--target-home` and `--state-dir` before the subcommand when exercising deployment behavior outside the real home.
