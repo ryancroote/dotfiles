@@ -177,6 +177,26 @@ class DeploymentTest(unittest.TestCase):
         self.quiet_apply()
         self.assertFalse((self.home / ".gitkeep").exists())
 
+    def test_dotfilesignore_excludes_metadata_and_patterns(self):
+        (self.repo / ".dotfilesignore").write_text(
+            "# repository metadata\nskills-lock.json\n.config/cache/\n*.secret\n",
+            encoding="utf-8",
+        )
+        self.source("skills-lock.json", "{}\n")
+        self.source(".config/cache/generated", "ignored\n")
+        self.source(".config/private.secret", "ignored\n")
+        self.source(".config/app/config", "deployed\n")
+
+        self.quiet_apply()
+
+        self.assertFalse((self.home / "skills-lock.json").exists())
+        self.assertFalse((self.home / ".config/cache").exists())
+        self.assertFalse((self.home / ".config/private.secret").exists())
+        self.assertEqual(
+            (self.home / ".config/app/config").read_text(encoding="utf-8"),
+            "deployed\n",
+        )
+
     def test_unknown_restore_target_does_not_change_active_state(self):
         self.source(".profile", "managed\n")
         destination = self.target(".profile", "original\n")
@@ -200,6 +220,63 @@ class DeploymentTest(unittest.TestCase):
 
         self.assertEqual(destination.read_text(encoding="utf-8"), "one\n")
         self.assertEqual(self.deployment.current_state()["transaction"], first)
+
+
+class SkillManagementTest(unittest.TestCase):
+    def test_add_targets_universal_directory_with_copies(self):
+        command = dotfiles.skills_command(
+            Path("/fake/npx"),
+            ["add", "owner/repo", "--skill", "example"],
+        )
+        self.assertEqual(
+            command,
+            [
+                "/fake/npx",
+                "--yes",
+                "skills",
+                "add",
+                "owner/repo",
+                "--skill",
+                "example",
+                "--agent",
+                "universal",
+                "--copy",
+            ],
+        )
+
+    def test_global_and_alternate_agent_flags_are_rejected(self):
+        for flag in ("--global", "-g", "--agent", "-a", "--all"):
+            with self.subTest(flag=flag), self.assertRaises(dotfiles.DotfilesError):
+                dotfiles.skills_command(Path("/fake/npx"), ["add", "owner/repo", flag])
+
+    def test_update_is_limited_to_project(self):
+        command = dotfiles.skills_command(Path("/fake/npx"), ["update", "--yes"])
+        self.assertEqual(
+            command,
+            ["/fake/npx", "--yes", "skills", "update", "--yes", "--project"],
+        )
+
+    def test_manage_skills_runs_from_home_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            (repo / "home").mkdir()
+            with mock.patch.object(dotfiles.shutil, "which", return_value="/fake/npx"), mock.patch.object(
+                dotfiles, "run_command"
+            ) as run:
+                dotfiles.manage_skills(repo, ["list", "--json"])
+            run.assert_called_once_with(
+                ["/fake/npx", "--yes", "skills", "list", "--json"],
+                cwd=repo / "home",
+            )
+
+    def test_parser_passes_through_skill_arguments(self):
+        args = dotfiles.make_parser().parse_args(
+            ["skills", "add", "owner/repo", "--skill", "example"]
+        )
+        self.assertEqual(
+            args.arguments,
+            ["add", "owner/repo", "--skill", "example"],
+        )
 
 
 class PlatformTest(unittest.TestCase):

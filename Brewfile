@@ -9,4 +9,5 @@
 #   brew "util-linux"
 # end
 #
-# Keep this file intentionally minimal until packages are selected.
+# npx is used by ./dotfiles skills to manage agent skills.
+brew "node"

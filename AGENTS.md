@@ -5,7 +5,8 @@
 | Path | Purpose |
 |---|---|
 | `home/` | Canonical files copied into the active home |
-| `dotfiles` | Standard-library Python deployment and bootstrap CLI |
+| `dotfiles` | Standard-library Python deployment, bootstrap, and skill-management CLI |
+| `.dotfilesignore` | Repository-only paths excluded from home deployment |
 | `Brewfile` | Cross-platform Homebrew package inventory |
 | `tests/` | Standard-library unit tests using temporary homes |
 
@@ -15,6 +16,8 @@ Runtime state must remain outside the repository, normally in `${XDG_STATE_HOME:
 
 - Preserve the directory structure beneath `home/`; every leaf maps to the same relative path beneath `$HOME`.
 - `home/.gitkeep` only retains the source root in Git and is intentionally not deployed.
+- Keep repository metadata such as `home/skills-lock.json` in `.dotfilesignore`.
+- Install third-party skills with `./dotfiles skills`; review their instructions and scripts before deployment.
 - Use transactional copies rather than links to the checkout.
 - Keep the CLI dependency-free beyond Python 3 and operating-system bootstrap tools.
 - Put packages in `Brewfile`, using `on_macos` and `on_linux` for platform-specific entries.
@@ -25,7 +28,7 @@ Runtime state must remain outside the repository, normally in `${XDG_STATE_HOME:
 
 | Task | Location |
 |---|---|
-| Agent skill | `home/.agents/skills/<name>/README.md` |
+| Agent skill | `home/.agents/skills/<name>/SKILL.md` |
 
 ## commands
 
@@ -34,6 +37,7 @@ Runtime state must remain outside the repository, normally in `${XDG_STATE_HOME:
 ./dotfiles apply --dry-run
 ./dotfiles status
 ./dotfiles doctor
+./dotfiles skills list --json
 python3 -m unittest discover -s tests -v
 python3 -m py_compile dotfiles
 ```
@@ -43,6 +47,8 @@ Use `--target-home` and `--state-dir` before the subcommand when exercising depl
 ## anti-patterns
 
 - Do not directly modify the real home while testing the installer.
+- Do not install repository-managed skills with `npx skills --global`.
+- Do not commit an unreviewed third-party skill.
 - Do not make a Git checkout immediately active through symlinks.
 - Do not delete backups automatically.
 - Do not run Homebrew installation as root.

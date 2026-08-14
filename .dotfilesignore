@@ -1,0 +1,3 @@
+# Repository metadata beneath home/ that must not be deployed.
+.gitkeep
+skills-lock.json

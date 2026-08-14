@@ -14,7 +14,7 @@ State and private backups are stored by default in:
 ${XDG_STATE_HOME:-$HOME/.local/state}/dotfiles/
 ```
 
-The state directory is created with mode `0700`. Backups are retained until manually removed.
+The state directory is created with mode `0700`. Backups are retained until manually removed. Repository-only paths listed in `.dotfilesignore` are not copied into the active home. Ignore entries are relative to `home/`, support shell-style wildcards, and may include comments beginning with `#`.
 
 ## First installation
 
@@ -118,6 +118,39 @@ cd "$HOME/Projects/dotfiles"  # adjust to the checkout location
 
 Transaction data is under `~/.local/state/dotfiles/transactions/`; forced-restore and interrupted-recovery snapshots are under `~/.local/state/dotfiles/rescues/`.
 
+## Agent skills
+
+Use the Python CLI to install skills into `home/.agents/skills/`:
+
+```sh
+./dotfiles skills find "typescript testing"
+./dotfiles skills add owner/repo --skill skill-name
+```
+
+The command runs `npx skills` from `home/`, targets the universal `.agents/skills/` location, and uses copies so installed files can be committed. Global or alternate-agent installation flags are rejected to keep skills inside this repository.
+
+Review every downloaded `SKILL.md` and any bundled scripts before committing or deploying them. Skills can instruct an agent to execute commands.
+
+Other operations use the same command:
+
+```sh
+./dotfiles skills list --json
+./dotfiles skills update --yes
+./dotfiles skills remove skill-name --yes
+```
+
+`home/skills-lock.json` records installed skill sources for reproducible updates. It is committed to Git but excluded from home deployment by `.dotfilesignore`.
+
+After adding or updating a skill, review and deploy it:
+
+```sh
+git diff -- home/.agents home/skills-lock.json
+./dotfiles apply --dry-run
+./dotfiles apply
+```
+
+Pi discovers the deployed skill from `~/.agents/skills/` after starting a new session. A skill can also be loaded explicitly with `/skill:<name>`.
+
 ## Homebrew packages
 
 `Brewfile` is the package inventory:
@@ -160,12 +193,13 @@ The CLI locates Homebrew in the standard Apple Silicon, Intel macOS, and Linuxbr
 | `history` | List transactions and identify the active one |
 | `restore` | Reverse one or more active transactions |
 | `doctor` | Check platform and deployment health |
+| `skills` | Manage repository skills through `npx skills` |
 
 `install`, `bootstrap`, `packages`, and `apply` support `--dry-run`. Mutating commands that prompt support `--yes`.
 
 ## Development
 
-The implementation uses only the Python standard library. Run its tests with:
+The deployment implementation uses only the Python standard library. Node.js is installed through the Brewfile solely for `npx skills`. Run tests with:
 
 ```sh
 python3 -m unittest discover -s tests -v
