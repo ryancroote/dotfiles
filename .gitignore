@@ -1,3 +1,6 @@
+# Local transactional state (normally stored outside this repository)
+.dotfiles-state/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

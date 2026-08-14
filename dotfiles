@@ -1,0 +1,821 @@
+#!/usr/bin/env python3
+"""Transactional dotfile deployment and Homebrew bootstrap utility."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import platform
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+VERSION = 1
+BREW_INSTALL_URL = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
+
+
+class DotfilesError(RuntimeError):
+    pass
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def transaction_id() -> str:
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def lexists(path: Path) -> bool:
+    return os.path.lexists(str(path))
+
+
+def mode_bits(path: Path) -> int:
+    return stat.S_IMODE(path.lstat().st_mode)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def path_metadata(path: Path, recursive: bool = True) -> Dict[str, Any]:
+    """Return stable metadata without following symlinks."""
+    if not lexists(path):
+        return {"kind": "absent"}
+    info = path.lstat()
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISLNK(info.st_mode):
+        return {"kind": "symlink", "target": os.readlink(str(path))}
+    if stat.S_ISREG(info.st_mode):
+        return {
+            "kind": "file",
+            "mode": mode,
+            "size": info.st_size,
+            "sha256": sha256_file(path),
+        }
+    if stat.S_ISDIR(info.st_mode):
+        result: Dict[str, Any] = {"kind": "directory", "mode": mode}
+        if recursive:
+            entries: List[Tuple[str, Dict[str, Any]]] = []
+            for root, dirnames, filenames in os.walk(str(path), followlinks=False):
+                root_path = Path(root)
+                # os.walk puts symlinked directories in dirnames; record but do not descend.
+                for name in list(dirnames):
+                    child = root_path / name
+                    if child.is_symlink():
+                        dirnames.remove(name)
+                        rel = child.relative_to(path).as_posix()
+                        entries.append((rel, path_metadata(child, recursive=False)))
+                    else:
+                        rel = child.relative_to(path).as_posix() + "/"
+                        entries.append((rel, path_metadata(child, recursive=False)))
+                for name in filenames:
+                    child = root_path / name
+                    rel = child.relative_to(path).as_posix()
+                    entries.append((rel, path_metadata(child, recursive=False)))
+            payload = json.dumps(sorted(entries), sort_keys=True, separators=(",", ":"))
+            result["tree_sha256"] = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return result
+    return {"kind": "special", "mode": mode}
+
+
+def same_metadata(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    return dict(left) == dict(right)
+
+
+def remove_path(path: Path) -> None:
+    if not lexists(path):
+        return
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+    else:
+        shutil.rmtree(str(path))
+
+
+def copy_path(source: Path, destination: Path) -> None:
+    """Copy one filesystem object without following symlinks."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    remove_path(destination)
+    if source.is_symlink():
+        os.symlink(os.readlink(str(source)), str(destination))
+    elif source.is_dir():
+        shutil.copytree(str(source), str(destination), symlinks=True, copy_function=shutil.copy2)
+    elif source.is_file():
+        shutil.copy2(str(source), str(destination), follow_symlinks=False)
+    else:
+        raise DotfilesError(f"Unsupported filesystem object: {source}")
+
+
+def deploy_leaf(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.parent / f".dotfiles-tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        if source.is_symlink():
+            os.symlink(os.readlink(str(source)), str(temporary))
+        elif source.is_file():
+            shutil.copy2(str(source), str(temporary), follow_symlinks=False)
+        else:
+            raise DotfilesError(f"Source leaf is not a file or symlink: {source}")
+        remove_path(destination)
+        os.replace(str(temporary), str(destination))
+    finally:
+        remove_path(temporary)
+
+
+def atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(str(temporary), str(path))
+
+
+def read_json(path: Path, default: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    if not path.exists():
+        return dict(default or {})
+    try:
+        with path.open(encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise DotfilesError(f"Cannot read state file {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise DotfilesError(f"State file is not a JSON object: {path}")
+    return value
+
+
+def is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def intersects(left: Path, right: Path) -> bool:
+    return is_relative_to(left, right) or is_relative_to(right, left)
+
+
+class Deployment:
+    def __init__(self, repo: Path, target_home: Path, state_dir: Path) -> None:
+        self.repo = repo.resolve()
+        self.source = (self.repo / "home").resolve()
+        self.target_home = target_home.expanduser().resolve()
+        self.state_dir = state_dir.expanduser().resolve()
+        self.transactions_dir = self.state_dir / "transactions"
+        self.current_path = self.state_dir / "current.json"
+        self.journal_path = self.state_dir / "journal.json"
+        if not self.source.is_dir():
+            raise DotfilesError(f"Dotfile source directory does not exist: {self.source}")
+        if self.target_home == Path("/"):
+            raise DotfilesError("Refusing to use the filesystem root as the target home")
+
+    def ensure_state(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            self.state_dir.chmod(0o700)
+        except OSError:
+            pass
+        self.transactions_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def assert_no_journal(self) -> None:
+        if self.journal_path.exists():
+            journal = read_json(self.journal_path)
+            txn = journal.get("transaction", "unknown")
+            raise DotfilesError(
+                f"An interrupted transaction ({txn}) needs recovery. "
+                "Run './dotfiles restore --recover'."
+            )
+
+    def inventory(self) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+        leaves: Dict[str, Dict[str, Any]] = {}
+        directories: List[str] = []
+        for root, dirnames, filenames in os.walk(str(self.source), followlinks=False):
+            root_path = Path(root)
+            for name in list(dirnames):
+                child = root_path / name
+                rel = child.relative_to(self.source).as_posix()
+                if child.is_symlink():
+                    dirnames.remove(name)
+                    leaves[rel] = path_metadata(child, recursive=False)
+                else:
+                    directories.append(rel)
+            for name in filenames:
+                child = root_path / name
+                rel = child.relative_to(self.source).as_posix()
+                if rel == ".gitkeep":
+                    continue
+                metadata = path_metadata(child, recursive=False)
+                if metadata["kind"] not in ("file", "symlink"):
+                    raise DotfilesError(f"Unsupported source object: {child}")
+                leaves[rel] = metadata
+        for rel in leaves:
+            destination = self.target_home / Path(rel)
+            if intersects(destination, self.state_dir):
+                raise DotfilesError(f"Managed path would overlap installer state: {rel}")
+            if intersects(destination, self.repo):
+                raise DotfilesError(f"Managed path would overlap this repository: {rel}")
+        for rel in directories:
+            destination = self.target_home / Path(rel)
+            if is_relative_to(destination, self.state_dir):
+                raise DotfilesError(f"Managed directory would overlap installer state: {rel}")
+            if is_relative_to(destination, self.repo):
+                raise DotfilesError(f"Managed directory would overlap this repository: {rel}")
+        return dict(sorted(leaves.items())), sorted(set(directories), key=lambda item: (item.count("/"), item))
+
+    def current_state(self) -> Dict[str, Any]:
+        state = read_json(
+            self.current_path,
+            {"version": VERSION, "transaction": None, "files": {}, "created_dirs": []},
+        )
+        if state.get("version") != VERSION:
+            raise DotfilesError("Unsupported deployment state version")
+        state.setdefault("files", {})
+        state.setdefault("created_dirs", [])
+        return state
+
+    def status(self) -> int:
+        desired, _ = self.inventory()
+        current = self.current_state()
+        managed = current.get("files", {})
+        findings: List[str] = []
+        for rel, source_meta in desired.items():
+            destination = self.target_home / Path(rel)
+            actual = path_metadata(destination, recursive=False)
+            if rel not in managed and actual["kind"] != "absent":
+                findings.append(f"conflict  {rel}")
+            elif actual["kind"] == "absent":
+                findings.append(f"missing   {rel}")
+            elif not same_metadata(actual, source_meta):
+                findings.append(f"modified  {rel}")
+        for rel in sorted(set(managed) - set(desired)):
+            destination = self.target_home / Path(rel)
+            if lexists(destination):
+                findings.append(f"stale     {rel}")
+        if findings:
+            print("\n".join(findings))
+            return 1
+        print(f"Clean: {len(desired)} managed file(s)")
+        return 0
+
+    def planned_changes(self) -> Tuple[List[str], Dict[str, Dict[str, Any]], List[str], Dict[str, Any]]:
+        desired, source_dirs = self.inventory()
+        current = self.current_state()
+        managed = current.get("files", {})
+        changes: List[str] = []
+        required_dirs = set(source_dirs)
+        for rel in desired:
+            parent = Path(rel).parent
+            while parent != Path("."):
+                required_dirs.add(parent.as_posix())
+                parent = parent.parent
+        for rel in sorted(required_dirs, key=lambda item: (item.count("/"), item)):
+            destination = self.target_home / Path(rel)
+            if not lexists(destination) or destination.is_symlink() or not destination.is_dir():
+                changes.append(f"ensure directory {rel}")
+        for rel, metadata in desired.items():
+            if not same_metadata(path_metadata(self.target_home / Path(rel), recursive=False), metadata):
+                changes.append(f"deploy {rel}")
+        desired_paths = [Path(item) for item in desired]
+        for rel in sorted(set(managed) - set(desired)):
+            old = Path(rel)
+            covered = rel in required_dirs or any(new != old and new in old.parents for new in desired_paths)
+            if not covered and lexists(self.target_home / old):
+                changes.append(f"remove {rel}")
+        for rel in current.get("created_dirs", []):
+            if rel not in required_dirs:
+                path = self.target_home / Path(rel)
+                if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
+                    changes.append(f"remove empty directory {rel}")
+        return changes, desired, sorted(required_dirs, key=lambda item: (item.count("/"), item)), current
+
+    def apply(self, dry_run: bool = False, assume_yes: bool = False) -> Optional[str]:
+        self.assert_no_journal()
+        changes, desired, required_dirs, previous = self.planned_changes()
+        if not changes:
+            # Keep source metadata current even if an old state file is absent.
+            if not dry_run:
+                self.ensure_state()
+                state = {
+                    "version": VERSION,
+                    "transaction": previous.get("transaction"),
+                    "files": desired,
+                    "created_dirs": previous.get("created_dirs", []),
+                    "updated_at": utc_now(),
+                }
+                atomic_json(self.current_path, state)
+            print("No dotfile changes to apply")
+            return None
+        print("Planned dotfile changes:")
+        for change in changes:
+            print(f"  - {change}")
+        if dry_run:
+            return None
+        if not assume_yes and not confirm("Apply these changes?"):
+            raise DotfilesError("Apply cancelled")
+
+        self.ensure_state()
+        txn_id = transaction_id()
+        txn_dir = self.transactions_dir / txn_id
+        txn_dir.mkdir(parents=True, mode=0o700)
+        manifest_path = txn_dir / "manifest.json"
+        manifest: Dict[str, Any] = {
+            "version": VERSION,
+            "id": txn_id,
+            "created_at": utc_now(),
+            "status": "in_progress",
+            "previous_state": previous,
+            "actions": [],
+        }
+        atomic_json(manifest_path, manifest)
+        atomic_json(self.journal_path, {"version": VERSION, "transaction": txn_id})
+        created_dirs = set(previous.get("created_dirs", []))
+
+        def mutate(rel: str, operation: str, callback: Any) -> None:
+            target = self.target_home / Path(rel)
+            before = path_metadata(target)
+            action_number = len(manifest["actions"])
+            backup_name: Optional[str] = None
+            if before["kind"] != "absent":
+                backup_name = f"{action_number:06d}"
+                copy_path(target, txn_dir / "backup" / backup_name)
+            action = {
+                "path": rel,
+                "operation": operation,
+                "before": before,
+                "backup": backup_name,
+            }
+            manifest["actions"].append(action)
+            atomic_json(manifest_path, manifest)
+            callback(target)
+
+        try:
+            for rel in required_dirs:
+                destination = self.target_home / Path(rel)
+                if lexists(destination) and not destination.is_symlink() and destination.is_dir():
+                    continue
+
+                source_directory = self.source / Path(rel)
+                directory_mode = mode_bits(source_directory) if source_directory.is_dir() else 0o700
+
+                def make_directory(target: Path, mode: int = directory_mode) -> None:
+                    remove_path(target)
+                    target.mkdir(parents=False, mode=mode)
+                    target.chmod(mode)
+
+                mutate(rel, "ensure_directory", make_directory)
+                created_dirs.add(rel)
+
+            desired_paths = [Path(item) for item in desired]
+            for rel, metadata in desired.items():
+                destination = self.target_home / Path(rel)
+                if same_metadata(path_metadata(destination, recursive=False), metadata):
+                    continue
+                source = self.source / Path(rel)
+                mutate(rel, "deploy", lambda target, src=source: deploy_leaf(src, target))
+
+            managed = previous.get("files", {})
+            for rel in sorted(set(managed) - set(desired), key=lambda item: (-item.count("/"), item)):
+                old = Path(rel)
+                covered = rel in set(required_dirs) or any(new != old and new in old.parents for new in desired_paths)
+                if covered or not lexists(self.target_home / old):
+                    continue
+                mutate(rel, "remove", remove_path)
+
+            for rel in sorted(list(created_dirs), key=lambda item: (-item.count("/"), item)):
+                if rel in set(required_dirs):
+                    continue
+                directory = self.target_home / Path(rel)
+                if directory.is_dir() and not directory.is_symlink() and not any(directory.iterdir()):
+                    mutate(rel, "remove_empty_directory", remove_path)
+                    created_dirs.remove(rel)
+
+            final_state = {
+                "version": VERSION,
+                "transaction": txn_id,
+                "files": desired,
+                "created_dirs": sorted(created_dirs),
+                "updated_at": utc_now(),
+            }
+            # Capture final states only after the whole tree has been transformed so
+            # overlapping parent actions include their deployed descendants.
+            for action in manifest["actions"]:
+                action["after"] = path_metadata(self.target_home / Path(action["path"]))
+            manifest["status"] = "complete"
+            manifest["completed_at"] = utc_now()
+            manifest["result_state"] = final_state
+            atomic_json(self.current_path, final_state)
+            atomic_json(manifest_path, manifest)
+            self.journal_path.unlink()
+        except BaseException:
+            # Leave the journal in place; restore --recover can replay recorded actions.
+            raise
+        print(f"Applied transaction {txn_id}")
+        return txn_id
+
+    def history(self) -> List[Dict[str, Any]]:
+        self.ensure_state()
+        records: List[Dict[str, Any]] = []
+        for path in sorted(self.transactions_dir.glob("*/manifest.json"), reverse=True):
+            record = read_json(path)
+            records.append(record)
+        if not records:
+            print("No deployment transactions")
+            return records
+        active = self.current_state().get("transaction")
+        for record in records:
+            marker = "*" if record.get("id") == active else " "
+            print(
+                f"{marker} {record.get('id', 'unknown')}  "
+                f"{record.get('status', 'unknown'):11}  {len(record.get('actions', []))} change(s)"
+            )
+        return records
+
+    def _rescue_actions(self, actions: Sequence[Mapping[str, Any]], label: str) -> Optional[Path]:
+        paths = [Path(str(action["path"])) for action in actions]
+        topmost = [path for path in paths if not any(parent in paths for parent in path.parents)]
+        existing = [path for path in topmost if lexists(self.target_home / path)]
+        if not existing:
+            return None
+        rescue = self.state_dir / "rescues" / f"{transaction_id()}-{label}"
+        rescue.mkdir(parents=True, mode=0o700)
+        index: Dict[str, str] = {}
+        for number, rel in enumerate(existing):
+            name = f"{number:06d}"
+            copy_path(self.target_home / rel, rescue / "backup" / name)
+            index[rel.as_posix()] = name
+        atomic_json(rescue / "manifest.json", {"created_at": utc_now(), "paths": index})
+        return rescue
+
+    def _reverse(self, manifest: Dict[str, Any], recover: bool, force: bool) -> None:
+        txn_id = str(manifest.get("id", "unknown"))
+        actions = manifest.get("actions", [])
+        if not isinstance(actions, list):
+            raise DotfilesError(f"Invalid transaction manifest: {txn_id}")
+        drift: List[str] = []
+        if not recover:
+            for action in actions:
+                expected = action.get("after")
+                if expected is None:
+                    raise DotfilesError(f"Transaction {txn_id} has no completed after-state")
+                actual = path_metadata(self.target_home / Path(action["path"]))
+                if not same_metadata(actual, expected):
+                    drift.append(str(action["path"]))
+        if drift and not force:
+            joined = ", ".join(drift[:5])
+            suffix = "..." if len(drift) > 5 else ""
+            raise DotfilesError(
+                f"Active files changed after transaction {txn_id}: {joined}{suffix}. "
+                "Re-run with --force to preserve them in a rescue backup and restore anyway."
+            )
+        rescue = self._rescue_actions(actions, "recovery" if recover else "restore") if (force or recover) else None
+        txn_dir = self.transactions_dir / txn_id
+        for action in reversed(actions):
+            target = self.target_home / Path(action["path"])
+            remove_path(target)
+            backup_name = action.get("backup")
+            if backup_name:
+                copy_path(txn_dir / "backup" / str(backup_name), target)
+        previous = manifest.get("previous_state") or {
+            "version": VERSION,
+            "transaction": None,
+            "files": {},
+            "created_dirs": [],
+        }
+        atomic_json(self.current_path, previous)
+        manifest["status"] = "recovered" if recover else "rolled_back"
+        manifest["restored_at"] = utc_now()
+        if rescue:
+            manifest["rescue"] = str(rescue)
+        atomic_json(txn_dir / "manifest.json", manifest)
+        if self.journal_path.exists():
+            self.journal_path.unlink()
+        message = f"Recovered interrupted transaction {txn_id}" if recover else f"Restored state before {txn_id}"
+        if rescue:
+            message += f" (current files rescued to {rescue})"
+        print(message)
+
+    def restore(
+        self,
+        target: str = "latest",
+        recover: bool = False,
+        force: bool = False,
+        assume_yes: bool = False,
+    ) -> None:
+        self.ensure_state()
+        if recover:
+            if not self.journal_path.exists():
+                raise DotfilesError("There is no interrupted transaction to recover")
+            txn_id = str(read_json(self.journal_path).get("transaction"))
+            manifest = read_json(self.transactions_dir / txn_id / "manifest.json")
+            if not assume_yes and not confirm(f"Recover interrupted transaction {txn_id}?"):
+                raise DotfilesError("Recovery cancelled")
+            self._reverse(manifest, recover=True, force=True)
+            return
+        self.assert_no_journal()
+        active = self.current_state().get("transaction")
+        if not active:
+            raise DotfilesError("There is no active transaction to restore")
+        if target != "latest":
+            chain: List[str] = []
+            cursor: Optional[str] = str(active)
+            while cursor:
+                chain.append(cursor)
+                candidate = read_json(self.transactions_dir / cursor / "manifest.json")
+                previous_state = candidate.get("previous_state") or {}
+                prior = previous_state.get("transaction")
+                cursor = str(prior) if prior else None
+            if target not in chain:
+                raise DotfilesError(f"Transaction is not in the active history: {target}")
+        while active:
+            txn_id = str(active)
+            manifest_path = self.transactions_dir / txn_id / "manifest.json"
+            manifest = read_json(manifest_path)
+            if manifest.get("status") != "complete":
+                raise DotfilesError(f"Active transaction is not restorable: {txn_id}")
+            if not assume_yes and not confirm(f"Restore state before transaction {txn_id}?"):
+                raise DotfilesError("Restore cancelled")
+            self._reverse(manifest, recover=False, force=force)
+            if target in ("latest", txn_id):
+                return
+            active = self.current_state().get("transaction")
+        raise DotfilesError(f"Transaction is not in the active history: {target}")
+
+
+# Homebrew bootstrap -------------------------------------------------------
+
+
+def parse_os_release(path: Path = Path("/etc/os-release")) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    if not path.exists():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def platform_family(system: Optional[str] = None, release: Optional[Mapping[str, str]] = None) -> str:
+    system = system or platform.system()
+    if system == "Darwin":
+        return "macos"
+    if system != "Linux":
+        return "unsupported"
+    release = dict(release or parse_os_release())
+    identifiers = {release.get("ID", "").lower()}
+    identifiers.update(release.get("ID_LIKE", "").lower().split())
+    if identifiers.intersection({"ubuntu", "debian", "linuxmint", "pop"}):
+        return "debian"
+    if identifiers.intersection({"fedora", "rhel", "centos"}):
+        return "fedora"
+    return "unsupported"
+
+
+def prerequisite_commands(family: str, assume_yes: bool) -> List[List[str]]:
+    yes = ["-y"] if assume_yes else []
+    if family == "debian":
+        return [
+            ["sudo", "apt-get", "update"],
+            ["sudo", "apt-get", "install", *yes, "build-essential", "procps", "curl", "file", "git"],
+        ]
+    if family == "fedora":
+        return [
+            ["sudo", "dnf", "group", "install", *yes, "development-tools"],
+            ["sudo", "dnf", "install", *yes, "procps-ng", "curl", "file", "git"],
+        ]
+    return []
+
+
+def find_brew() -> Optional[Path]:
+    found = shutil.which("brew")
+    candidates = [
+        Path(found) if found else None,
+        Path("/opt/homebrew/bin/brew"),
+        Path("/usr/local/bin/brew"),
+        Path("/home/linuxbrew/.linuxbrew/bin/brew"),
+        Path.home() / ".linuxbrew/bin/brew",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file() and os.access(str(candidate), os.X_OK):
+            return candidate
+    return None
+
+
+def printable_command(command: Sequence[str]) -> str:
+    import shlex
+
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def run_command(command: Sequence[str], env: Optional[Mapping[str, str]] = None) -> None:
+    print(f"+ {printable_command(command)}")
+    try:
+        subprocess.run(list(command), check=True, env=dict(env) if env else None)
+    except FileNotFoundError as error:
+        raise DotfilesError(f"Required command was not found: {command[0]}") from error
+    except subprocess.CalledProcessError as error:
+        raise DotfilesError(f"Command failed with exit code {error.returncode}: {printable_command(command)}") from error
+
+
+def confirm(prompt: str) -> bool:
+    if not sys.stdin.isatty():
+        raise DotfilesError(f"Confirmation required for '{prompt}'; use --yes in non-interactive mode")
+    answer = input(f"{prompt} [y/N] ").strip().lower()
+    return answer in ("y", "yes")
+
+
+def bootstrap_homebrew(assume_yes: bool = False, dry_run: bool = False) -> Path:
+    existing = find_brew()
+    if existing:
+        print(f"Homebrew is already installed at {existing}")
+        return existing
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        raise DotfilesError("Homebrew must not be installed as root")
+    family = platform_family()
+    if family == "unsupported":
+        release = parse_os_release()
+        name = release.get("PRETTY_NAME", platform.system())
+        raise DotfilesError(
+            f"Automatic Homebrew prerequisites are not supported on {name}. "
+            "Install curl, file, git, procps, and compiler development tools, then retry."
+        )
+    commands = prerequisite_commands(family, assume_yes)
+    if commands:
+        print(f"Homebrew prerequisites for {family} Linux:")
+        for command in commands:
+            print(f"  {printable_command(command)}")
+        if not dry_run:
+            if not assume_yes and not confirm("Install native Homebrew prerequisites?"):
+                raise DotfilesError("Bootstrap cancelled")
+            for command in commands:
+                run_command(command)
+    if dry_run:
+        print(f"Would download and run the official installer from {BREW_INSTALL_URL}")
+        return Path("brew")
+    print(f"Downloading the official Homebrew installer from {BREW_INSTALL_URL}")
+    try:
+        with urllib.request.urlopen(BREW_INSTALL_URL, timeout=30) as response:
+            installer = response.read()
+    except Exception as error:
+        raise DotfilesError(f"Could not download the Homebrew installer: {error}") from error
+    with tempfile.NamedTemporaryFile(prefix="homebrew-install-", suffix=".sh", delete=False) as handle:
+        handle.write(installer)
+        installer_path = Path(handle.name)
+    try:
+        environment = os.environ.copy()
+        if assume_yes:
+            environment["NONINTERACTIVE"] = "1"
+        run_command(["/bin/bash", str(installer_path)], env=environment)
+    finally:
+        installer_path.unlink(missing_ok=True)
+    brew = find_brew()
+    if not brew:
+        raise DotfilesError("Homebrew installer finished, but the brew executable could not be located")
+    print(f"Homebrew installed at {brew}")
+    return brew
+
+
+def install_packages(repo: Path, dry_run: bool = False) -> None:
+    brewfile = repo / "Brewfile"
+    if not brewfile.is_file():
+        raise DotfilesError(f"Brewfile does not exist: {brewfile}")
+    brew = find_brew()
+    if not brew:
+        raise DotfilesError("Homebrew is not installed; run './dotfiles bootstrap' first")
+    command = [str(brew), "bundle", f"--file={brewfile}"]
+    if dry_run:
+        print(f"Would run: {printable_command(command)}")
+    else:
+        run_command(command)
+
+
+def default_state_dir(target_home: Path) -> Path:
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg and target_home.resolve() == Path.home().resolve():
+        return Path(xdg).expanduser() / "dotfiles"
+    return target_home / ".local/state/dotfiles"
+
+
+def build_deployment(args: argparse.Namespace, repo: Path) -> Deployment:
+    target = Path(args.target_home).expanduser() if args.target_home else Path.home()
+    state = Path(args.state_dir).expanduser() if args.state_dir else default_state_dir(target)
+    return Deployment(repo, target, state)
+
+
+def doctor(repo: Path, deployment: Deployment) -> int:
+    problems: List[str] = []
+    family = platform_family()
+    print(f"Platform:       {platform.system()} ({family})")
+    print(f"Repository:     {repo}")
+    print(f"Source:         {deployment.source}")
+    print(f"Target home:    {deployment.target_home}")
+    print(f"State:          {deployment.state_dir}")
+    brew = find_brew()
+    print(f"Homebrew:       {brew if brew else 'not installed'}")
+    if not deployment.source.is_dir():
+        problems.append("home/ source directory is missing")
+    if deployment.journal_path.exists():
+        problems.append("an interrupted transaction requires recovery")
+    try:
+        deployment.inventory()
+    except DotfilesError as error:
+        problems.append(str(error))
+    if problems:
+        for problem in problems:
+            print(f"ERROR: {problem}", file=sys.stderr)
+        return 1
+    print("Doctor found no dotfile deployment problems")
+    return 0
+
+
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target-home", help="deploy into this home instead of $HOME")
+    parser.add_argument("--state-dir", help="override the transaction state directory")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def action_flags(command: argparse.ArgumentParser, yes: bool = True, dry: bool = True) -> None:
+        if yes:
+            command.add_argument("-y", "--yes", action="store_true", help="do not prompt")
+        if dry:
+            command.add_argument("--dry-run", action="store_true", help="show actions without changing anything")
+
+    install = subparsers.add_parser("install", help="bootstrap, install packages, and deploy dotfiles")
+    action_flags(install)
+    bootstrap = subparsers.add_parser("bootstrap", help="install Homebrew and its prerequisites")
+    action_flags(bootstrap)
+    packages = subparsers.add_parser("packages", help="install the repository Brewfile")
+    action_flags(packages, yes=False)
+    apply = subparsers.add_parser("apply", help="transactionally deploy home/")
+    action_flags(apply)
+    subparsers.add_parser("status", help="show active-home drift")
+    subparsers.add_parser("history", help="list deployment transactions")
+    restore = subparsers.add_parser("restore", help="restore state from a transaction")
+    restore.add_argument("transaction", nargs="?", default="latest", help="latest or an active transaction ID")
+    restore.add_argument("--recover", action="store_true", help="recover an interrupted apply")
+    restore.add_argument("--force", action="store_true", help="rescue drift and restore anyway")
+    restore.add_argument("-y", "--yes", action="store_true", help="do not prompt")
+    subparsers.add_parser("doctor", help="check platform and deployment health")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = make_parser()
+    args = parser.parse_args(argv)
+    repo = Path(__file__).resolve().parent
+    try:
+        deployment = build_deployment(args, repo)
+        if args.command == "bootstrap":
+            bootstrap_homebrew(args.yes, args.dry_run)
+        elif args.command == "packages":
+            install_packages(repo, args.dry_run)
+        elif args.command == "apply":
+            deployment.apply(args.dry_run, args.yes)
+        elif args.command == "install":
+            bootstrap_homebrew(args.yes, args.dry_run)
+            if not args.dry_run:
+                install_packages(repo)
+            else:
+                print(f"Would install packages from {repo / 'Brewfile'}")
+            deployment.apply(args.dry_run, args.yes)
+        elif args.command == "status":
+            return deployment.status()
+        elif args.command == "history":
+            deployment.history()
+        elif args.command == "restore":
+            deployment.restore(args.transaction, args.recover, args.force, args.yes)
+        elif args.command == "doctor":
+            return doctor(repo, deployment)
+        return 0
+    except DotfilesError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("error: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
