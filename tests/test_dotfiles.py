@@ -229,7 +229,7 @@ class SkillManagementTest(unittest.TestCase):
         self.runner = mock.Mock(spec=CommandRunner)
         self.manager = SkillManager(Path("/repo"), self.runner)
 
-    def test_add_targets_universal_directory_with_copies(self):
+    def test_add_is_noninteractive_project_install_with_copies(self):
         command = self.manager.build_command(
             Path("/fake/npx"),
             ["add", "owner/repo", "--skill", "example"],
@@ -247,8 +247,16 @@ class SkillManagementTest(unittest.TestCase):
                 "--agent",
                 "universal",
                 "--copy",
+                "--yes",
             ],
         )
+
+    def test_add_does_not_duplicate_explicit_confirmation_flag(self):
+        command = self.manager.build_command(
+            Path("/fake/npx"),
+            ["add", "owner/repo", "--yes"],
+        )
+        self.assertEqual(command.count("--yes"), 2)  # one for npx and one for skills
 
     def test_global_and_alternate_agent_flags_are_rejected(self):
         for flag in ("--global", "-g", "--agent", "-a", "--all"):
@@ -257,6 +265,47 @@ class SkillManagementTest(unittest.TestCase):
                     Path("/fake/npx"),
                     ["add", "owner/repo", flag],
                 )
+
+    def test_remove_targets_the_whole_project_without_prompting(self):
+        command = self.manager.build_command(
+            Path("/fake/npx"),
+            ["remove", "example"],
+        )
+        self.assertEqual(
+            command,
+            ["/fake/npx", "--yes", "skills", "remove", "example", "--yes"],
+        )
+        self.assertNotIn("--agent", command)
+
+    def test_remove_all_is_allowed_for_the_project(self):
+        command = self.manager.build_command(
+            Path("/fake/npx"),
+            ["remove", "--all"],
+        )
+        self.assertEqual(
+            command,
+            ["/fake/npx", "--yes", "skills", "remove", "--all", "--yes"],
+        )
+
+    def test_query_searches_the_skill_catalog(self):
+        command = self.manager.build_command(
+            Path("/fake/npx"),
+            ["query", "python testing"],
+        )
+        self.assertEqual(
+            command,
+            ["/fake/npx", "--yes", "skills", "find", "python testing"],
+        )
+
+    def test_search_is_an_alias_for_query(self):
+        command = self.manager.build_command(
+            Path("/fake/npx"),
+            ["search", "deployment"],
+        )
+        self.assertEqual(
+            command,
+            ["/fake/npx", "--yes", "skills", "find", "deployment"],
+        )
 
     def test_update_is_limited_to_project(self):
         command = self.manager.build_command(

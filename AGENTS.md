@@ -24,7 +24,8 @@ Runtime state must remain outside the repository, normally in `${XDG_STATE_HOME:
 - Preserve the directory structure beneath `home/`; every leaf maps to the same relative path beneath `$HOME`.
 - `home/.gitkeep` only retains the source root in Git and is intentionally not deployed.
 - Keep repository metadata such as `home/skills-lock.json` in `.dotfilesignore`.
-- Install third-party skills with `./dotfiles skills`; review their instructions and scripts before deployment.
+- Install third-party skills with `./dotfiles skills`; additions and removals must be non-interactive project operations under `home/.agents/skills/`.
+- Review third-party skill instructions and scripts before deployment.
 - Use transactional copies rather than links to the checkout.
 - Keep the CLI dependency-free beyond Python 3 and operating-system bootstrap tools.
 - Put packages in `Brewfile`, using `on_macos` and `on_linux` for platform-specific entries.
@@ -48,6 +49,7 @@ Runtime state must remain outside the repository, normally in `${XDG_STATE_HOME:
 ./dotfiles apply --dry-run
 ./dotfiles status
 ./dotfiles doctor
+./dotfiles skills query "search terms"
 ./dotfiles skills list --json
 python3 -m unittest discover -s tests -v
 python3 -m py_compile dotfiles dotfiles_app/*.py

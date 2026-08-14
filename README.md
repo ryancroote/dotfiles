@@ -123,11 +123,12 @@ Transaction data is under `~/.local/state/dotfiles/transactions/`; forced-restor
 Use the Python CLI to install skills into `home/.agents/skills/`:
 
 ```sh
-./dotfiles skills find "typescript testing"
+./dotfiles skills query "typescript testing"
+./dotfiles skills query "react" --owner vercel-labs
 ./dotfiles skills add owner/repo --skill skill-name
 ```
 
-The command runs `npx skills` from `home/`, targets the universal `.agents/skills/` location, and uses copies so installed files can be committed. Global or alternate-agent installation flags are rejected to keep skills inside this repository.
+`query` and `search` both search the public skill catalog through `npx skills find`. Skill additions are non-interactive project installs: the command runs from `home/`, passes `--yes`, targets the universal `.agents/skills/` location, and uses copies so installed files can be committed. Global or alternate-agent installation flags are rejected to keep skills inside this repository.
 
 Review every downloaded `SKILL.md` and any bundled scripts before committing or deploying them. Skills can instruct an agent to execute commands.
 
@@ -136,8 +137,11 @@ Other operations use the same command:
 ```sh
 ./dotfiles skills list --json
 ./dotfiles skills update --yes
-./dotfiles skills remove skill-name --yes
+./dotfiles skills remove skill-name
+./dotfiles skills remove --all
 ```
+
+Removal is non-interactive and targets the complete project rather than one agent view. This removes the canonical directory from `home/.agents/skills/` and its entry from `home/skills-lock.json`.
 
 `home/skills-lock.json` records installed skill sources for reproducible updates. It is committed to Git but excluded from home deployment by `.dotfilesignore`.
 

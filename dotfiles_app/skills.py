@@ -13,9 +13,15 @@ from .system import CommandRunner
 class SkillManager:
     """Runs npx skills while keeping installations in the canonical home tree."""
 
-    ALIASES = {"a": "add", "rm": "remove", "upgrade": "update"}
+    ALIASES = {
+        "a": "add",
+        "query": "find",
+        "rm": "remove",
+        "search": "find",
+        "upgrade": "update",
+    }
     REPOSITORY_ONLY_COMMANDS = {"add", "remove", "update"}
-    FORBIDDEN_FLAGS = {"-g", "--global", "-a", "--agent", "--all"}
+    FORBIDDEN_FLAGS = {"-g", "--global", "-a", "--agent"}
 
     def __init__(self, repo: Path, runner: Optional[CommandRunner] = None) -> None:
         self.repo = repo.resolve()
@@ -34,8 +40,11 @@ class SkillManager:
             command.extend(["--agent", "universal"])
             if "--copy" not in command_arguments:
                 command.append("--copy")
+            if "--yes" not in command_arguments and "-y" not in command_arguments:
+                command.append("--yes")
         elif command_name == "remove":
-            command.extend(["--agent", "universal"])
+            if "--yes" not in command_arguments and "-y" not in command_arguments:
+                command.append("--yes")
         elif (
             command_name == "update"
             and "--project" not in command_arguments
@@ -71,6 +80,7 @@ class SkillManager:
                 argument
                 for argument in arguments
                 if argument in self.FORBIDDEN_FLAGS
+                or (command_name == "add" and argument == "--all")
                 or argument.startswith("--global=")
                 or argument.startswith("--agent=")
             ),
