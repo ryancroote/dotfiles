@@ -12,6 +12,7 @@ from dotfiles_app.commands import (
     ApplyCommand,
     CommandContext,
     CommandFactory,
+    DoctorCommand,
     PackagesCommand,
 )
 from dotfiles_app.core import DotfilesError
@@ -373,6 +374,25 @@ class CommandPatternTest(unittest.TestCase):
         self.assertEqual(result, 7)
         command.execute.assert_called_once_with()
         factory.create.assert_called_once()
+
+    def test_doctor_reports_snap_and_ghostty_status_on_linux(self):
+        context = mock.Mock()
+        context.detector.family.return_value = "fedora"
+        context.homebrew.find_brew.return_value = Path("/home/linuxbrew/bin/brew")
+        context.ghostty.find_snap.return_value = Path("/usr/bin/snap")
+        context.ghostty.find_ghostty.return_value = Path("/snap/bin/ghostty")
+        context.deployment.source.is_dir.return_value = True
+        context.deployment.journal_path.exists.return_value = False
+        arguments = ArgumentParserFactory.create().parse_args(["doctor"])
+
+        with mock.patch("dotfiles_app.commands.platform.system", return_value="Linux"):
+            result = DoctorCommand(context, arguments).execute()
+
+        self.assertEqual(result, 0)
+        context.console.print.assert_any_call("Snap:           /usr/bin/snap")
+        context.console.print.assert_any_call(
+            "Ghostty:        /snap/bin/ghostty"
+        )
 
 
 class PlatformTest(unittest.TestCase):

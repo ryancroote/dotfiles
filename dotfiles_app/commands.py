@@ -143,14 +143,24 @@ class DoctorCommand(CliCommand):
     def execute(self) -> int:
         deployment = self.context.deployment
         problems = []
+        system = platform.system()
         family = self.context.detector.family()
-        self.context.console.print(f"Platform:       {platform.system()} ({family})")
+        self.context.console.print(f"Platform:       {system} ({family})")
         self.context.console.print(f"Repository:     {self.context.paths.repo}")
         self.context.console.print(f"Source:         {deployment.source}")
         self.context.console.print(f"Target home:    {deployment.target_home}")
         self.context.console.print(f"State:          {deployment.state_dir}")
         brew = self.context.homebrew.find_brew()
         self.context.console.print(f"Homebrew:       {brew if brew else 'not installed'}")
+        if system == "Linux":
+            snap = self.context.ghostty.find_snap()
+            ghostty = self.context.ghostty.find_ghostty()
+            self.context.console.print(
+                f"Snap:           {snap if snap else 'not installed'}"
+            )
+            self.context.console.print(
+                f"Ghostty:        {ghostty if ghostty else 'not installed'}"
+            )
         if not deployment.source.is_dir():
             problems.append("home/ source directory is missing")
         if deployment.journal_path.exists():

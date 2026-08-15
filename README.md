@@ -89,6 +89,8 @@ Run environment checks:
 ./dotfiles doctor
 ```
 
+On Linux, `doctor` also reports whether Snap and Ghostty are installed.
+
 ## Shell configuration
 
 Zsh configuration is split by responsibility:
@@ -98,7 +100,7 @@ Zsh configuration is split by responsibility:
 - `home/.zshrc` configures the interactive shell, portable tool paths, and prompts.
 - `home/.zimrc` declares Zim modules.
 
-On first interactive startup, `.zshrc` downloads the official Zim framework when it is missing and initializes the modules in `.zimrc`. Optional tools are guarded so the shell still starts when they are unavailable.
+On first interactive startup, `.zshrc` downloads the official Zim framework when it is missing and initializes the modules in `.zimrc`. Starship owns the prompt, so no Zim prompt theme is loaded. Optional tools are guarded so the shell still starts when they are unavailable.
 
 ## Restore and recovery
 
