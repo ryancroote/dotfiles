@@ -28,7 +28,8 @@ This command:
 2. Installs Linux prerequisites when Homebrew is absent.
 3. Installs Homebrew when needed.
 4. Runs the repository `Brewfile`.
-5. Transactionally deploys `home/`.
+5. On supported Linux systems, installs Snap when absent and installs Ghostty.
+6. Transactionally deploys `home/`.
 
 Use `--yes` for unattended operation:
 
@@ -49,6 +50,14 @@ On Ubuntu/Debian-family systems the bootstrap installs `build-essential`, `procp
 On Fedora-family systems it installs the `development-tools` group plus `procps-ng`, `curl`, `file`, and `git` with `dnf`.
 
 Native package installation uses `sudo`; Homebrew itself is never installed as root. Unsupported Linux distributions receive manual prerequisite instructions rather than being modified.
+
+Ghostty is installed separately because Homebrew only provides its cask on macOS. On Ubuntu/Debian-family systems, the installer adds `snapd` with `apt-get` when `snap` is missing. On Fedora-family systems, it adds `snapd` with `dnf`, enables `snapd.socket`, and creates the classic Snap `/snap` link when needed. It then runs:
+
+```sh
+sudo snap install ghostty --classic
+```
+
+Existing Snap and Ghostty installations are left unchanged. Preview these operations with `./dotfiles packages --dry-run`. After first setting up Snap on Fedora, sign out and back in if Ghostty does not appear in the application launcher.
 
 ## Daily workflow
 
@@ -79,6 +88,17 @@ Run environment checks:
 ```sh
 ./dotfiles doctor
 ```
+
+## Shell configuration
+
+Zsh configuration is split by responsibility:
+
+- `home/.zshenv` provides minimal user-local paths and optional Rust setup.
+- `home/.zprofile` initializes Homebrew and guarded platform integrations.
+- `home/.zshrc` configures the interactive shell, portable tool paths, and prompts.
+- `home/.zimrc` declares Zim modules.
+
+On first interactive startup, `.zshrc` downloads the official Zim framework when it is missing and initializes the modules in `.zimrc`. Optional tools are guarded so the shell still starts when they are unavailable.
 
 ## Restore and recovery
 
@@ -162,13 +182,8 @@ Pi discovers the deployed skill from `~/.agents/skills/` after starting a new se
 ```ruby
 brew "git"
 
-on_macos do
-  cask "iterm2"
-end
-
-on_linux do
-  brew "util-linux"
-end
+cask "ghostty" if OS.mac?
+brew "util-linux" if OS.linux?
 ```
 
 Install only packages without deploying files:
@@ -176,6 +191,8 @@ Install only packages without deploying files:
 ```sh
 ./dotfiles packages
 ```
+
+This runs Homebrew Bundle on every platform. It also ensures Snap and Ghostty are installed on supported Linux systems. Use `--yes` to skip the Linux installation prompt.
 
 Install or repair Homebrew without applying packages or files:
 
@@ -191,7 +208,7 @@ The CLI locates Homebrew in the standard Apple Silicon, Intel macOS, and Linuxbr
 |---|---|
 | `install` | Bootstrap Homebrew, install the Brewfile, and apply dotfiles |
 | `bootstrap` | Install platform prerequisites and Homebrew |
-| `packages` | Run `brew bundle` for this repository |
+| `packages` | Install the Brewfile and platform-specific packages |
 | `apply` | Transactionally copy `home/` into the target home |
 | `status` | Report active-home drift |
 | `history` | List transactions and identify the active one |
@@ -213,9 +230,10 @@ The executable `dotfiles` is a thin entry point. Object-oriented services live i
 - `deployment.py` owns inventories, plans, transactions, state, and restoration.
 - `filesystem.py` handles symlink-aware filesystem and atomic JSON operations.
 - `system.py` uses platform strategies for prerequisites and manages Homebrew.
+- `ghostty.py` installs Snap and Ghostty with platform-specific strategies.
 - `skills.py` manages repository-installed agent skills.
 
-The design uses Command for CLI actions, Factory for command and deployment creation, Strategy for platform prerequisites, and repository-style state objects for transaction persistence. Dependencies are injected so these components remain independently testable.
+The design uses Command for CLI actions, Factory for command and deployment creation, Strategy for platform prerequisites and Snap setup, and repository-style state objects for transaction persistence. Dependencies are injected so these components remain independently testable.
 
 Run tests with:
 

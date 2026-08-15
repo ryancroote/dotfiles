@@ -11,6 +11,7 @@ from typing import Dict, Mapping, Optional, Type
 from .configuration import ApplicationPaths
 from .core import Console, DotfilesError
 from .deployment import Deployment
+from .ghostty import GhosttyManager
 from .skills import SkillManager
 from .system import HomebrewManager, PlatformDetector
 
@@ -34,6 +35,7 @@ class CommandContext:
     paths: ApplicationPaths
     console: Console
     homebrew: HomebrewManager
+    ghostty: GhosttyManager
     skills: SkillManager
     detector: PlatformDetector
     deployment_factory: DeploymentFactory = field(default_factory=DeploymentFactory)
@@ -70,6 +72,10 @@ class BootstrapCommand(CliCommand):
 class PackagesCommand(CliCommand):
     def execute(self) -> int:
         self.context.homebrew.install_packages(self.arguments.dry_run)
+        self.context.ghostty.install(
+            self.arguments.yes,
+            self.arguments.dry_run,
+        )
         return 0
 
 
@@ -94,6 +100,10 @@ class InstallCommand(CliCommand):
             )
         else:
             self.context.homebrew.install_packages()
+        self.context.ghostty.install(
+            self.arguments.yes,
+            self.arguments.dry_run,
+        )
         self.context.deployment.apply(
             self.arguments.dry_run,
             self.arguments.yes,

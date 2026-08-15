@@ -12,6 +12,7 @@
 | `dotfiles_app/deployment.py` | Deployment planning, transactions, state, and restoration |
 | `dotfiles_app/filesystem.py` | Symlink-aware filesystem and atomic JSON services |
 | `dotfiles_app/system.py` | Platform detection, command execution, and Homebrew management |
+| `dotfiles_app/ghostty.py` | Platform-specific Snap setup and Ghostty installation |
 | `dotfiles_app/skills.py` | Repository-managed `npx skills` integration |
 | `.dotfilesignore` | Repository-only paths excluded from home deployment |
 | `Brewfile` | Cross-platform Homebrew package inventory |
@@ -28,7 +29,7 @@ Runtime state must remain outside the repository, normally in `${XDG_STATE_HOME:
 - Review third-party skill instructions and scripts before deployment.
 - Use transactional copies rather than links to the checkout.
 - Keep the CLI dependency-free beyond Python 3 and operating-system bootstrap tools.
-- Put packages in `Brewfile`, using `on_macos` and `on_linux` for platform-specific entries.
+- Put packages in `Brewfile`, using `if OS.mac?` and `if OS.linux?` for platform-specific entries.
 - Never add secrets or credentials beneath `home/`.
 - Filesystem changes must be journaled and recoverable before active-home paths are replaced.
 - Keep the entry point thin; add behavior to the responsible service class in `dotfiles_app/`.
@@ -41,6 +42,8 @@ Runtime state must remain outside the repository, normally in `${XDG_STATE_HOME:
 | Task | Location |
 |---|---|
 | Agent skill | `home/.agents/skills/<name>/SKILL.md` |
+| Neovim | `home/.config/nvim` |
+| Zsh | `home/.zshenv`, `home/.zprofile`, `home/.zshrc`, `home/.zimrc` |
 
 ## commands
 

@@ -8,9 +8,15 @@ from pathlib import Path
 from unittest import mock
 
 from dotfiles_app.app import ArgumentParserFactory, DotfilesApplication
-from dotfiles_app.commands import ApplyCommand, CommandContext, CommandFactory
+from dotfiles_app.commands import (
+    ApplyCommand,
+    CommandContext,
+    CommandFactory,
+    PackagesCommand,
+)
 from dotfiles_app.core import DotfilesError
 from dotfiles_app.deployment import Deployment
+from dotfiles_app.ghostty import FedoraSnapSetupStrategy, GhosttyManager
 from dotfiles_app.skills import SkillManager
 from dotfiles_app.system import CommandRunner, HomebrewManager, PlatformDetector
 
@@ -401,6 +407,123 @@ class PlatformTest(unittest.TestCase):
         commands = self.detector.prerequisites("fedora").commands(True)
         self.assertIn("development-tools", commands[0])
         self.assertIn("procps-ng", commands[1])
+
+
+class GhosttyManagerTest(unittest.TestCase):
+    def setUp(self):
+        self.runner = mock.Mock(spec=CommandRunner)
+        self.runner.printable.side_effect = CommandRunner.printable
+        self.detector = mock.Mock(spec=PlatformDetector)
+        self.manager = GhosttyManager(
+            runner=self.runner,
+            detector=self.detector,
+        )
+
+    def test_existing_ghostty_skips_snap_setup(self):
+        with mock.patch.object(
+            self.manager,
+            "find_ghostty",
+            return_value=Path("/snap/bin/ghostty"),
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.manager.install(assume_yes=True)
+
+        self.runner.run.assert_not_called()
+        self.detector.family.assert_not_called()
+
+    def test_existing_snap_installs_ghostty(self):
+        self.detector.family.return_value = "debian"
+        with mock.patch.object(
+            self.manager,
+            "find_ghostty",
+            return_value=None,
+        ), mock.patch.object(
+            self.manager,
+            "find_snap",
+            return_value=Path("/usr/bin/snap"),
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.manager.install(assume_yes=True)
+
+        self.runner.run.assert_called_once_with(
+            ["sudo", "/usr/bin/snap", "install", "ghostty", "--classic"]
+        )
+
+    def test_missing_snap_is_installed_before_ghostty_on_ubuntu(self):
+        self.detector.family.return_value = "debian"
+        with mock.patch.object(
+            self.manager,
+            "find_ghostty",
+            return_value=None,
+        ), mock.patch.object(
+            self.manager,
+            "find_snap",
+            side_effect=[None, Path("/usr/bin/snap")],
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.manager.install(assume_yes=True)
+
+        self.assertEqual(
+            self.runner.run.call_args_list,
+            [
+                mock.call(["sudo", "apt-get", "update"]),
+                mock.call(["sudo", "apt-get", "install", "-y", "snapd"]),
+                mock.call(
+                    [
+                        "sudo",
+                        "/usr/bin/snap",
+                        "install",
+                        "ghostty",
+                        "--classic",
+                    ]
+                ),
+            ],
+        )
+
+    def test_fedora_snap_setup_enables_service_and_classic_mount(self):
+        commands = FedoraSnapSetupStrategy().commands(
+            assume_yes=True,
+            snap_mount_exists=False,
+        )
+
+        self.assertEqual(
+            commands,
+            [
+                ["sudo", "dnf", "install", "-y", "snapd"],
+                ["sudo", "systemctl", "enable", "--now", "snapd.socket"],
+                ["sudo", "ln", "-s", "/var/lib/snapd/snap", "/snap"],
+            ],
+        )
+
+    def test_dry_run_does_not_install_snap_or_ghostty(self):
+        self.detector.family.return_value = "fedora"
+        output = io.StringIO()
+        with mock.patch.object(
+            self.manager,
+            "find_ghostty",
+            return_value=None,
+        ), mock.patch.object(
+            self.manager,
+            "find_snap",
+            return_value=None,
+        ), contextlib.redirect_stdout(output):
+            self.manager.install(assume_yes=True, dry_run=True)
+
+        self.runner.run.assert_not_called()
+        self.assertIn("dnf install -y snapd", output.getvalue())
+        self.assertIn("snap install ghostty --classic", output.getvalue())
+
+    def test_packages_command_installs_brewfile_and_linux_ghostty(self):
+        context = mock.Mock()
+        arguments = ArgumentParserFactory.create().parse_args(
+            ["packages", "--dry-run"]
+        )
+
+        result = PackagesCommand(context, arguments).execute()
+
+        self.assertEqual(result, 0)
+        context.homebrew.install_packages.assert_called_once_with(True)
+        context.ghostty.install.assert_called_once_with(False, True)
 
 
 class HomebrewManagerTest(unittest.TestCase):

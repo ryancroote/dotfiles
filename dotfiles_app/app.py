@@ -10,6 +10,7 @@ from typing import Optional, Sequence
 from .commands import CommandContext, CommandFactory
 from .configuration import ApplicationPaths
 from .core import Console, DotfilesError
+from .ghostty import GhosttyManager
 from .skills import SkillManager
 from .system import CommandRunner, HomebrewManager, PlatformDetector
 
@@ -44,9 +45,9 @@ class ArgumentParserFactory:
         ArgumentParserFactory._action_flags(bootstrap)
         packages = subparsers.add_parser(
             "packages",
-            help="install the repository Brewfile",
+            help="install the Brewfile and platform-specific packages",
         )
-        ArgumentParserFactory._action_flags(packages, yes=False)
+        ArgumentParserFactory._action_flags(packages)
         apply = subparsers.add_parser(
             "apply",
             help="transactionally deploy home/",
@@ -124,6 +125,11 @@ class DotfilesApplication:
             self.detector,
             self.console,
         )
+        self.ghostty = GhosttyManager(
+            self.runner,
+            self.detector,
+            self.console,
+        )
         self.skills = SkillManager(self.repo, self.runner)
         self.command_factory = command_factory or CommandFactory()
         self.parser = ArgumentParserFactory.create()
@@ -135,6 +141,7 @@ class DotfilesApplication:
             paths,
             self.console,
             self.homebrew,
+            self.ghostty,
             self.skills,
             self.detector,
         )
